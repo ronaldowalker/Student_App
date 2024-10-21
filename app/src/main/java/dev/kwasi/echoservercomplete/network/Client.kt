@@ -16,168 +16,159 @@ import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.text.Charsets.UTF_8
 
-class Client (private val networkMessageInterface: NetworkMessageInterface, seedPlaintext: String){
-    private lateinit var clientSocket: Socket
-    private lateinit var reader: BufferedReader
-    private lateinit var writer: BufferedWriter
-    var ip:String = ""
+class Client(private val messageListener: NetworkMessageInterface, studentIDSeed: String) {
+    private lateinit var socketConnection: Socket
+    private lateinit var inputReader: BufferedReader
+    private lateinit var outputWriter: BufferedWriter
+    var clientIp: String = ""
 
-    private val strongSeed = hashStrSha256(seedPlaintext)
-    private val aesKey = generateAESKey(strongSeed)
-    private val aesIV = generateIV(strongSeed)
-    private var firstMsg = true
-    private var bool = true
-
+    // Encrypting and authentication-related variables
+    private val hashedSeed = hashStringWithSHA256(studentIDSeed)
+    private val encryptionKey = generateAESKey(hashedSeed)
+    private val initializationVector = generateIV(hashedSeed)
+    
+    private var isFirstMessage = true
+    private var isValid = true
 
     init {
+        // Start a background thread for the client
         thread {
-            clientSocket = Socket("192.168.49.1", Server.PORT)
-            Log.e("dd",strongSeed)
-            reader = clientSocket.inputStream.bufferedReader()
-            writer = clientSocket.outputStream.bufferedWriter()
-            ip = clientSocket.inetAddress.hostAddress!!
+            // Establish a connection to the server
+            socketConnection = Socket("192.168.49.1", Server.PORT)
+            Log.e("Client", hashedSeed)
+            inputReader = socketConnection.inputStream.bufferedReader()
+            outputWriter = socketConnection.outputStream.bufferedWriter()
+            clientIp = socketConnection.inetAddress.hostAddress!!
 
+            try {
+                // Send initial handshake message to the server
+                val initialContent = ContentModel("Client connected", clientIp)
+                sendUnencryptedMessage(initialContent)
 
-            try{
-                val firstContent = ContentModel("I am here", ip)
-                sendMessagePlain(firstContent)
-                var serverResponse : String?
-                serverResponse = reader.readLine()
-                while(serverResponse == null){
-                    serverResponse = reader.readLine()
-                    Log.e("ERROR","Waiting on response from server")
-                }
-                var serverContent = Gson().fromJson(serverResponse, ContentModel::class.java)
-                Log.e("tester",serverContent.message)
-
-                val encryptedMsg = encryptMessage(serverContent.message,aesKey,aesIV)
-                Log.e("tester","#e")
-
-                val serverReply = ContentModel(encryptedMsg,strongSeed)
-                sendMessagePlain(serverReply)
-
-                serverResponse = reader.readLine()
-                while(serverResponse == null){
-                    serverResponse = reader.readLine()
-                    Log.e("ERROR","Waiting on response from server")
+                // Await server's response
+                var serverResponse = inputReader.readLine()
+                while (serverResponse == null) {
+                    serverResponse = inputReader.readLine()
+                    Log.e("Client", "Waiting for response from server")
                 }
 
-                sendMessagePlain(ContentModel(encryptMessage(seedPlaintext, aesKey, aesIV),ip))
+                var receivedContent = Gson().fromJson(serverResponse, ContentModel::class.java)
+                Log.e("Client", receivedContent.message)
 
-                serverResponse = reader.readLine()
-                while(serverResponse == null){
-                    serverResponse = reader.readLine()
-                    Log.e("ERROR","Waiting on response from server")
-                }
-                serverContent = Gson().fromJson(serverResponse, ContentModel::class.java)
-                if(decryptMessage(serverContent.message,aesKey,aesIV)!="VALID"){
+                // Encrypt the server's message and send a reply
+                val encryptedMessage = encryptText(receivedContent.message, encryptionKey, initializationVector)
+                val responseContent = ContentModel(encryptedMessage, hashedSeed)
+                sendUnencryptedMessage(responseContent)
 
-                    bool = false
-                    networkMessageInterface.failedConnection()
-                    clientSocket.close()
+                // Validate client with server
+                sendUnencryptedMessage(ContentModel(encryptText(studentIDSeed, encryptionKey, initializationVector), clientIp))
+                
+                // Validate server response
+                serverResponse = inputReader.readLine()
+                receivedContent = Gson().fromJson(serverResponse, ContentModel::class.java)
+                if (decryptText(receivedContent.message, encryptionKey, initializationVector) != "VALID") {
+                    isValid = false
+                    messageListener.failedConnection()
+                    socketConnection.close()
                 }
-            }catch(e:Exception){
-                Log.e("CLIENT", "An error has occurred in the client")
+            } catch (e: Exception) {
+                Log.e("Client", "Error during client-server communication")
                 e.printStackTrace()
             }
-                while(true){
-                    try{
-                        val serverResponse = reader.readLine()
-                        if (serverResponse != null){
-                            val serverContent = Gson().fromJson(serverResponse, ContentModel::class.java)
-                            if(firstMsg){
-                                sendMessage(serverContent)
-                                firstMsg=false
-                            }else{
-                                val temp=serverContent.message.reversed()
-                                serverContent.message=decryptMessage(temp,aesKey, aesIV)
-                                networkMessageInterface.onContent(serverContent)
-                            }
+
+            // Continuously listen for incoming messages from the server
+            while (true) {
+                try {
+                    val serverMessage = inputReader.readLine()
+                    if (serverMessage != null) {
+                        val receivedContent = Gson().fromJson(serverMessage, ContentModel::class.java)
+                        
+                        // Handle initial message separately
+                        if (isFirstMessage) {
+                            sendMessage(receivedContent)
+                            isFirstMessage = false
+                        } else {
+                            val decryptedMessage = decryptText(receivedContent.message.reversed(), encryptionKey, initializationVector)
+                            receivedContent.message = decryptedMessage
+                            messageListener.onContent(receivedContent)
                         }
-                    } catch(e: Exception){
-                        Log.e("CLIENT", "An error has occurred in the client")
-                        e.printStackTrace()
-                        break
                     }
+                } catch (e: Exception) {
+                    Log.e("Client", "Error during message handling")
+                    e.printStackTrace()
+                    break
                 }
+            }
         }
     }
 
-    fun sendMessage(content: ContentModel){
+    // Method to send an encrypted message
+    fun sendMessage(content: ContentModel) {
         thread {
-            if (!clientSocket.isConnected){
-                throw Exception("We aren't currently connected to the server!")
+            if (!socketConnection.isConnected) {
+                throw Exception("Client is not connected to the server!")
             }
 
-
-            content.message=encryptMessage(content.message, aesKey, aesIV)
-            val contentAsStr:String = Gson().toJson(content)
-            writer.write("$contentAsStr\n")
-            writer.flush()
+            content.message = encryptText(content.message, encryptionKey, initializationVector)
+            val serializedContent = Gson().toJson(content)
+            outputWriter.write("$serializedContent\n")
+            outputWriter.flush()
         }
-
     }
 
-    private fun sendMessagePlain(content: ContentModel){
+    // Method to send unencrypted (plain) message
+    private fun sendUnencryptedMessage(content: ContentModel) {
         thread {
-            if (!clientSocket.isConnected){
-                throw Exception("We aren't currently connected to the server!")
+            if (!socketConnection.isConnected) {
+                throw Exception("Client is not connected to the server!")
             }
 
-            val contentAsStr:String = Gson().toJson(content)
-            writer.write("$contentAsStr\n")
-            writer.flush()
+            val serializedContent = Gson().toJson(content)
+            outputWriter.write("$serializedContent\n")
+            outputWriter.flush()
         }
-
     }
 
-    fun close(){
-        firstMsg = true
-        clientSocket.close()
-
+    // Close the client connection
+    fun closeConnection() {
+        isFirstMessage = true
+        socketConnection.close()
     }
 
-    private fun ByteArray.toHex() = joinToString(separator = "") { byte -> "%02x".format(byte) }
-
-    private fun getFirstNChars(str: String, n:Int) = str.substring(0,n)
-
-    private fun hashStrSha256(str: String): String{
+    // Hashes a string using SHA-256 algorithm
+    private fun hashStringWithSHA256(input: String): String {
         val algorithm = "SHA-256"
-        val hashedString = MessageDigest.getInstance(algorithm).digest(str.toByteArray(UTF_8))
-        return hashedString.toHex()
+        val digest = MessageDigest.getInstance(algorithm).digest(input.toByteArray(UTF_8))
+        return digest.joinToString("") { byte -> "%02x".format(byte) }
     }
 
+    // Generate AES key from a hashed seed
     private fun generateAESKey(seed: String): SecretKeySpec {
-        val first32Chars = getFirstNChars(seed,32)
-        val secretKey = SecretKeySpec(first32Chars.toByteArray(), "AES")
-        return secretKey
+        val first32Chars = seed.take(32)
+        return SecretKeySpec(first32Chars.toByteArray(), "AES")
     }
 
+    // Generate IV (Initialization Vector) for AES encryption from a hashed seed
     private fun generateIV(seed: String): IvParameterSpec {
-        val first16Chars = getFirstNChars(seed, 16)
+        val first16Chars = seed.take(16)
         return IvParameterSpec(first16Chars.toByteArray())
     }
 
+    // Encrypt the message using AES encryption
     @OptIn(ExperimentalEncodingApi::class)
-    private fun encryptMessage(plaintext: String, aesKey: SecretKey, aesIv: IvParameterSpec):String{
-        val plainTextByteArr = plaintext.toByteArray()
-
+    private fun encryptText(plainText: String, key: SecretKey, iv: IvParameterSpec): String {
         val cipher = Cipher.getInstance("AES/CBC/PKCS5PADDING")
-        cipher.init(Cipher.ENCRYPT_MODE, aesKey, aesIv)
-        val encrypt = cipher.doFinal(plainTextByteArr)
-        return Base64.Default.encode(encrypt)
+        cipher.init(Cipher.ENCRYPT_MODE, key, iv)
+        val encryptedBytes = cipher.doFinal(plainText.toByteArray())
+        return Base64.Default.encode(encryptedBytes)
     }
 
+    // Decrypt the message using AES decryption
     @OptIn(ExperimentalEncodingApi::class)
-    private fun decryptMessage(encryptedText: String, aesKey: SecretKey, aesIv: IvParameterSpec):String{
-        val textToDecrypt = Base64.Default.decode(encryptedText)
-
+    private fun decryptText(encryptedText: String, key: SecretKey, iv: IvParameterSpec): String {
+        val decodedBytes = Base64.Default.decode(encryptedText)
         val cipher = Cipher.getInstance("AES/CBC/PKCS5PADDING")
-
-        cipher.init(Cipher.DECRYPT_MODE, aesKey,aesIv)
-
-        val decrypt = cipher.doFinal(textToDecrypt)
-        return String(decrypt)
-
+        cipher.init(Cipher.DECRYPT_MODE, key, iv)
+        return String(cipher.doFinal(decodedBytes))
     }
 }
